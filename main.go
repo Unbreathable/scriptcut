@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,9 +18,44 @@ import (
 
 var client *genai.Client
 
+const cutsDir = "cuts"
+
+func ensureCutsDir() error {
+	info, err := os.Stat(cutsDir)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("%s exists and is not a directory", cutsDir)
+		}
+
+		var deleteExisting bool
+		confirmForm := huh.NewForm(
+			huh.NewGroup(
+				huh.NewConfirm().
+					Title("Cuts folder already exists. Delete it?").
+					Value(&deleteExisting),
+			),
+		)
+		if err := confirmForm.Run(); err != nil {
+			return err
+		}
+		if deleteExisting {
+			if err := os.RemoveAll(cutsDir); err != nil {
+				return err
+			}
+			return os.MkdirAll(cutsDir, 0755)
+		}
+
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+
+	return os.MkdirAll(cutsDir, 0755)
+}
+
 func main() {
 	inputFlag := flag.String("i", "", "Input video file (required)")
-	outputFlag := flag.String("o", "output.mp4", "Output video file (default: output.mp4)")
 	scriptFlag := flag.String("s", "", "Script file to use for cutting (required without -c)")
 	promptFlag := flag.String("p", "", "Prompt to pass to ScriptCut")
 	cutsFlag := flag.String("c", "", "Cuts to apply in LLM format: 00:00:01-00:00:05,00:00:10-00:00:20")
@@ -39,12 +75,14 @@ func main() {
 	}
 
 	videoFile := *inputFlag
-	outputFile := *outputFlag
 
 	// If -c is provided, skip the LLM entirely and just apply the cuts
 	if *cutsFlag != "" {
+		if err := ensureCutsDir(); err != nil {
+			log.Fatal(err)
+		}
 		cuts := parseStamps(*cutsFlag)
-		applyCuts(cuts, videoFile, outputFile)
+		applyCuts(cuts, videoFile)
 		return
 	}
 
@@ -100,7 +138,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	audioFile := "audio.mp3"
+	if err := ensureCutsDir(); err != nil {
+		log.Fatal(err)
+	}
+
+	audioFile := filepath.Join(cutsDir, "audio.mp3")
 	cmd := exec.Command("ffmpeg", "-i", videoFile, "-q:a", "0", "-map", "a", audioFile)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -136,21 +178,28 @@ func main() {
 
 	// The system prompt
 	systemPrompt := `
-	Your name is ScriptCut, you are an AI helping to cut videos using the user's script. The user my talk to you (in the prompt or in the provided audio) by referring to you as Scriptcut.
+	Your name is ScriptCut, you are an AI helping to cut videos using the user's script. The user may talk to you (in the prompt or in the provided audio) by referring to you as Scriptcut.
 
 	The script of the user will be provided to you in <SCRIPT></SCRIPT> tags. Additionally, a prompt MAY be provided in <PROMPT></PROMPT> tags. This way you should be able to clearly tell them apart. The audio will be attached as a file.
 
-	Your job is to cut a video just using the audio of the video according to the user's script. They might be saying things a little off script sometimes, so at appropriate times you might also use that in order for the whole video to make sense according to the script.
+	Your job is to cut a video into multiple parts just using the audio of the video according to the user's script. They might be saying things a little off script sometimes, so at appropriate times you might also use that in order for the whole video to make sense according to the script. The goal is to, at the end, have a list of cuts for the original video that, when combined, are the person reading the script.
 
-	Provide the result in the following JSON format (this is an example):
+	Provide the result in the following format (this is an example):
 	00:01:00-00:02:00,00:02:00-00:03:00
 
 	You can also use more accurate timestamps (with a max of two numbers behind the dot):
 	00:00:13.20-00:00:15.30
 
-	Separate the timestamps with a comma, as in the examples above. DO NOT PUT THE JSON IN A CODE BLOCK. NO MARKDOWN.
+	The format means the following:
+	HH:MM:SS.xx
 
-	Don't cut out little breaks when they aren't huge: You shouldn't cut out less than a second of a break between different clips. Cut clips together seamlessly, make exact cuts and make sure it all fits together. Do not edit in things with the same meaning, strictly do it by looking at the script.
+	Explanation for the format:
+	- xx is fractional seconds, up to two decimals.
+	- SS, MM, and HH CAN NOT BE BIGGER THAN 60. ALWAYS PROVIDE HH AS WELL.
+
+	Separate the timestamps with a comma, as in the examples above. DO NOT PUT IT IN A CODE BLOCK. NO MARKDOWN. NO PUTTING THEM IN SEPARATE LINES.
+
+	Don't cut out little breaks when they aren't huge: You shouldn't cut out less than a second of a break between different clips. Cut clips together seamlessly, do not make exact cuts, always leave 2 seconds before and after your cut there even when there is no speech, but do not merge. Do not edit in things with the same meaning, strictly do it by looking at the script. DO NOT cut off sentences.
 	`
 
 	// Generate the actual response
@@ -160,6 +209,35 @@ func main() {
 	}
 	contents := []*genai.Content{
 		genai.NewContentFromParts(parts, "user"),
+	}
+
+	countTokensResponse, err := client.Models.CountTokens(
+		ctx,
+		selectedModel,
+		contents,
+		nil,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var proceed bool
+	confirmForm := huh.NewForm(
+		huh.NewGroup(
+			huh.NewConfirm().
+				Title(fmt.Sprintf(
+					"Input tokens=%d. Continue?",
+					countTokensResponse.TotalTokens,
+				)).
+				Value(&proceed),
+		),
+	)
+	if err := confirmForm.Run(); err != nil {
+		log.Fatal(err)
+	}
+	if !proceed {
+		fmt.Println("Canceled by user.")
+		return
 	}
 
 	// Actually prompt gemini to cut the video
@@ -174,7 +252,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	fmt.Println("Cutting using:", response.Text())
 
 	cuts := parseStamps(response.Text())
-	applyCuts(cuts, videoFile, outputFile)
+	applyCuts(cuts, videoFile)
 }
