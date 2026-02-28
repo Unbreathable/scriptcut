@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -10,42 +10,64 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/joho/godotenv"
 	"google.golang.org/genai"
 )
 
 var client *genai.Client
 
-type Timestamps struct {
-}
-
 func main() {
-	if err := godotenv.Load(); err != nil {
-		panic(err)
+	inputFlag := flag.String("i", "", "Input video file (required)")
+	outputFlag := flag.String("o", "output.mp4", "Output video file (default: output.mp4)")
+	scriptFlag := flag.String("s", "", "Script file to use for cutting (required without -c)")
+	promptFlag := flag.String("p", "", "Prompt to pass to ScriptCut")
+	cutsFlag := flag.String("c", "", "Cuts to apply in LLM format: 00:00:01-00:00:05,00:00:10-00:00:20")
+	flag.Parse()
+
+	// Collect any leftover args as an inline prompt if -p was not used
+	prompt := *promptFlag
+	if prompt == "" && flag.NArg() > 0 {
+		prompt = strings.Join(flag.Args(), " ")
 	}
 
-	// Parse the video file passed in as an argument
-	args := os.Args
-	if len(args) < 3 {
-		log.Fatal("Usage: scriptcut <video-file> <prompt>")
+	// Validate required flags
+	if *inputFlag == "" {
+		fmt.Fprintln(os.Stderr, "error: input file is required (-i)")
+		flag.Usage()
+		os.Exit(1)
 	}
-	inputFile := args[1]
-	prompt := strings.Join(args[2:], " ")
-	outputFile := "audio.mp3"
 
-	cmd := exec.Command("ffmpeg", "-i", inputFile, "-q:a", "0", "-map", "a", outputFile)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("ffmpeg conversion failed: %v", err)
+	videoFile := *inputFlag
+	outputFile := *outputFlag
+
+	// If -c is provided, skip the LLM entirely and just apply the cuts
+	if *cutsFlag != "" {
+		cuts := parseStamps(*cutsFlag)
+		applyCuts(cuts, videoFile, outputFile)
+		return
 	}
-	fmt.Printf("Audio written to %s\n", outputFile)
-	// Delete the audio file that was used with the Gemini API
-	defer os.Remove("audio.mp3")
+
+	if *scriptFlag == "" {
+		fmt.Fprintln(os.Stderr, "error: script file is required (-s) unless cuts are provided directly (-c)")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// Read script file
+	scriptBytes, err := os.ReadFile(*scriptFlag)
+	if err != nil {
+		log.Fatalf("failed to read script file: %v", err)
+	}
+	script := strings.TrimSpace(string(scriptBytes))
+
+	// Build the user message content that will be sent to Gemini
+	userMessage := fmt.Sprintf("<SCRIPT>%s</SCRIPT>\n<PROMPT>%s</PROMPT>", script, prompt)
+
+	godotenv.Load()
 
 	// Create a new client for the gemini api
 	ctx := context.Background()
-	var err error
 	client, err = genai.NewClient(ctx, &genai.ClientConfig{
 		APIKey:  os.Getenv("GEMINI_KEY"),
 		Backend: genai.BackendGeminiAPI,
@@ -54,10 +76,43 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Count tokens
+	// List available models and let user select one
+	modelList, err := client.Models.List(ctx, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var modelOptions []huh.Option[string]
+	for _, m := range modelList.Items {
+		modelOptions = append(modelOptions, huh.NewOption(m.Name, m.Name))
+	}
+
+	var selectedModel string
+	modelForm := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Select a Gemini model").
+				Options(modelOptions...).
+				Value(&selectedModel),
+		),
+	)
+	if err := modelForm.Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	audioFile := "audio.mp3"
+	cmd := exec.Command("ffmpeg", "-i", videoFile, "-q:a", "0", "-map", "a", audioFile)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("ffmpeg conversion failed: %v", err)
+	}
+	fmt.Printf("Audio written to %s\n", audioFile)
+	defer os.Remove(audioFile)
+
 	file, err := client.Files.UploadFromPath(
 		ctx,
-		"audio.mp3",
+		audioFile,
 		&genai.UploadFileConfig{
 			MIMEType: "audio/mp3",
 		},
@@ -67,7 +122,7 @@ func main() {
 	}
 	defer client.Files.Delete(ctx, file.Name, nil)
 
-	// Poll until the video file is completely processed (state becomes ACTIVE).
+	// Poll until the audio file is completely processed (state becomes ACTIVE).
 	for file.State == genai.FileStateUnspecified || file.State != genai.FileStateActive {
 		fmt.Println("Processing audio...")
 		fmt.Println("File state:", file.State)
@@ -81,21 +136,26 @@ func main() {
 
 	// The system prompt
 	systemPrompt := `
-	Your job is to cut a video just using the audio of the video according to the user's prompt. 
-	
+	Your name is ScriptCut, you are an AI helping to cut videos using the user's script. The user my talk to you (in the prompt or in the provided audio) by referring to you as Scriptcut.
+
+	The script of the user will be provided to you in <SCRIPT></SCRIPT> tags. Additionally, a prompt MAY be provided in <PROMPT></PROMPT> tags. This way you should be able to clearly tell them apart. The audio will be attached as a file.
+
+	Your job is to cut a video just using the audio of the video according to the user's script. They might be saying things a little off script sometimes, so at appropriate times you might also use that in order for the whole video to make sense according to the script.
+
 	Provide the result in the following JSON format (this is an example):
-	{"stamps":"00:01:00-00:02:00,00:02:00-00:03:00"}
+	00:01:00-00:02:00,00:02:00-00:03:00
 
 	You can also use more accurate timestamps (with a max of two numbers behind the dot):
-	{"stamps":"00:00:13.20-00:00:15.30"}
+	00:00:13.20-00:00:15.30
 
-	Separate the timestamps with a comma, as in the examples above. DO NOT PUT THE JSON IN A CODE BLOCK.
-	Don't cut out little breaks when they aren't huge: You shouldn't cut out less than a second of a break between different clips.
+	Separate the timestamps with a comma, as in the examples above. DO NOT PUT THE JSON IN A CODE BLOCK. NO MARKDOWN.
+
+	Don't cut out little breaks when they aren't huge: You shouldn't cut out less than a second of a break between different clips. Cut clips together seamlessly, make exact cuts and make sure it all fits together. Do not edit in things with the same meaning, strictly do it by looking at the script.
 	`
 
 	// Generate the actual response
 	parts := []*genai.Part{
-		genai.NewPartFromText(prompt),
+		genai.NewPartFromText(userMessage),
 		genai.NewPartFromURI(file.URI, file.MIMEType),
 	}
 	contents := []*genai.Content{
@@ -105,7 +165,7 @@ func main() {
 	// Actually prompt gemini to cut the video
 	response, err := client.Models.GenerateContent(
 		ctx,
-		os.Getenv("GEMINI_MODEL"),
+		selectedModel,
 		contents,
 		&genai.GenerateContentConfig{
 			SystemInstruction: genai.NewContentFromText(systemPrompt, genai.RoleUser),
@@ -114,75 +174,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(response.Text())
 
-	// Parse the timestamps
-	var outputJson struct {
-		Stamps string `json:"stamps"`
-	}
-	if err := json.Unmarshal([]byte(response.Text()), &outputJson); err != nil {
-		panic("Gemini gave invalid output... why do you have to do this to me?")
-	}
-	var cuts []struct {
-		Start string
-		End   string
-	}
-	for _, cut := range strings.Split(outputJson.Stamps, ",") {
-		cutArgs := strings.Split(cut, "-")
-		cuts = append(cuts, struct {
-			Start string
-			End   string
-		}{
-			Start: cutArgs[0],
-			End:   cutArgs[1],
-		})
-	}
-
-	// Generate all of the cuts
-	listFile, err := os.Create("cut_files.txt")
-	if err != nil {
-		log.Fatalln("failed to create list file:", err)
-	}
-	defer func() {
-		listFile.Close()
-		os.Remove(listFile.Name())
-	}()
-	os.Mkdir(".cuts", os.ModeDir)
-	for i, c := range cuts {
-
-		// Extract the little part from the actual file
-		outputPath := fmt.Sprintf(".cuts/cut_%d.mp4", i)
-		cmd := exec.Command(
-			"ffmpeg",
-			"-ss", c.Start,
-			"-to", c.End,
-			"-i", inputFile,
-			"-c", "copy",
-			outputPath,
-		)
-		if err := cmd.Run(); err != nil {
-			log.Fatalln("cut", i, "failed:", err)
-		}
-
-		// Add the cutted file to the list for ffmpeg
-		if _, err := fmt.Fprintf(listFile, "file '%s'\n", outputPath); err != nil {
-			log.Fatalln("failed writing to list file:", err)
-		}
-	}
-	defer func() {
-		os.RemoveAll(".cuts/")
-	}()
-
-	// Concat all the files using ffmpeg
-	cmd = exec.Command(
-		"ffmpeg",
-		"-f", "concat",
-		"-safe", "0",
-		"-i", listFile.Name(),
-		"-c", "copy",
-		"output.mp4",
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Fatalf("ffmpeg concat failed: %v – output: %s", err, output)
-	}
+	cuts := parseStamps(response.Text())
+	applyCuts(cuts, videoFile, outputFile)
 }
