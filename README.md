@@ -6,7 +6,7 @@ When I first thought about this idea I was like: This is never going to work. Bu
 
 ### Requirements
 
-- (Golang)[https://go.dev/dl]
+- [Golang](https://go.dev/dl)
 - FFMpeg (find out how to download it for your OS)
 - A API key for the [Gemini API](https://ai.google.dev/gemini-api/docs)
 
