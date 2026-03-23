@@ -4,6 +4,12 @@ When I first thought about this idea I was like: This is never going to work. Bu
 
 ## Usage
 
+### Video
+
+[![Scriptcut Tutorial](https://img.youtube.com/vi/IFRgf5s-mqg/0.jpg)](https://www.youtube.com/watch?v=IFRgf5s-mqg)
+
+If you would rather watch a video on how to use Scriptcut, just click [here](https://www.youtube.com/watch?v=IFRgf5s-mqg) or on the image above.
+
 ### Requirements
 
 - [Golang](https://go.dev/dl)
